@@ -12,6 +12,7 @@ use crossterm::event::DisableMouseCapture;
 use crossterm::event::DisableFocusChange;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableFocusChange;
+use crossterm::event::EnableMouseCapture;
 use crossterm::event::KeyboardEnhancementFlags;
 use crossterm::event::PopKeyboardEnhancementFlags;
 use crossterm::event::PushKeyboardEnhancementFlags;
@@ -99,7 +100,17 @@ pub fn init(config: &Config) -> Result<(Tui, TerminalInfo)> {
     }
 
     // Enter alternate screen mode for full screen TUI
-    execute!(stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    execute!(
+        stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        // Route mouse-wheel events to the existing TUI mouse handler. Without
+        // this, the alternate-scroll fallback can leak arrow escape sequences
+        // through Windows Terminal/ConPTY instead of scrolling chat history.
+        // TODO(windows): Revisit global mouse capture. It makes wheel scrolling
+        // reliable but intercepts ordinary terminal drag-selection; Shift+drag
+        // and Ctrl+M currently provide the native-selection escape hatch.
+        EnableMouseCapture
+    )?;
 
     // Query terminal capabilities and font size after entering alternate screen
     // but before enabling raw mode
@@ -286,6 +297,7 @@ pub fn enter_alt_screen_only(theme_fg: ratatui::style::Color, theme_bg: ratatui:
         let _ = execute!(stdout(), EnableFocusChange);
     }
     let _ = execute!(stdout(), EnableBracketedPaste);
+    let _ = execute!(stdout(), EnableMouseCapture);
     let _ = enable_alternate_scroll_mode();
     execute!(
         stdout(),
@@ -376,14 +388,10 @@ fn should_enable_focus_change() -> bool {
     #[cfg(windows)]
     {
         let term_program = env::var("TERM_PROGRAM").unwrap_or_default().to_lowercase();
-        let is_windows_terminal = !env::var("WT_SESSION").unwrap_or_default().is_empty()
-            || term_program.contains("windows_terminal");
-        let is_msys = env::var("MSYSTEM").is_ok(); // Git Bash / MSYS2
-        let looks_like_mintty = term_program.contains("mintty")
-            || env::var("TERM_PROGRAM").unwrap_or_default().contains("mintty");
-        let looks_like_conemu = term_program.contains("conemu") || term_program.contains("cmder");
+        let wt_session = !env::var("WT_SESSION").unwrap_or_default().is_empty();
+        let msystem = env::var("MSYSTEM").is_ok(); // Git Bash / MSYS2
 
-        if is_msys || looks_like_mintty || looks_like_conemu || (is_windows_terminal && is_msys) {
+        if should_disable_focus_change_on_windows(&term_program, wt_session, msystem) {
             return false;
         }
     }
@@ -395,6 +403,21 @@ fn should_enable_focus_change() -> bool {
 
     // Default: enabled for modern terminals (xterm-256color, iTerm2, Alacritty, kitty, tmux, etc.)
     true
+}
+
+#[cfg(windows)]
+fn should_disable_focus_change_on_windows(
+    term_program: &str,
+    wt_session: bool,
+    msystem: bool,
+) -> bool {
+    let is_windows_terminal = wt_session || term_program.contains("windows_terminal");
+    let looks_like_mintty = term_program.contains("mintty");
+    let looks_like_conemu = term_program.contains("conemu") || term_program.contains("cmder");
+
+    // Windows Terminal can echo DECSET 1004 focus reports as literal input
+    // even outside Git Bash/MSYS. Keep the old MSYS/mintty/ConEmu guards too.
+    is_windows_terminal || msystem || looks_like_mintty || looks_like_conemu
 }
 
 pub(crate) fn should_enable_keyboard_enhancement() -> bool {
@@ -429,6 +452,24 @@ pub(crate) fn should_enable_keyboard_enhancement() -> bool {
 #[cfg(test)]
 mod tests {
     use super::should_enable_keyboard_enhancement;
+
+    #[cfg(windows)]
+    #[test]
+    fn focus_tracking_is_disabled_for_windows_terminal_without_msys() {
+        assert!(super::should_disable_focus_change_on_windows(
+            "powershell",
+            true,
+            false,
+        ));
+        assert!(super::should_disable_focus_change_on_windows(
+            "windows_terminal",
+            false,
+            false,
+        ));
+        assert!(!super::should_disable_focus_change_on_windows(
+            "conhost", false, false,
+        ));
+    }
 
     #[test]
     fn keyboard_enhancement_respects_env_overrides() {
